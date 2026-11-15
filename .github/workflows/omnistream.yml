@@ -1,0 +1,287 @@
+name: OmniStream 24-7 Autonomous AI Engine
+
+on:
+  workflow_dispatch:
+
+jobs:
+  live_node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Instalar FFmpeg y Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          pip install aiogram requests google-api-python-client google-auth
+
+      - name: Iniciar Cerebro Autonomo 24/7
+        env:
+          G_CLIENT_ID: ${{ secrets.G_CLIENT_ID }}
+          G_CLIENT_SECRET: ${{ secrets.G_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          cat << 'PYEOF' > autonomous_streamer.py
+          import os, time, json, asyncio, subprocess, requests
+          from datetime import datetime, timezone
+          from aiogram import Bot, Dispatcher, types
+          from aiogram.filters import Command
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+
+          TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+          ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
+          GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+          GH_TOKEN = os.getenv("GH_PAT_TOKEN")
+          GH_REPO = os.getenv("GITHUB_REPOSITORY")
+
+          GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+          POLLINATIONS_URL = "https://text.pollinations.ai/openai"
+          YT_RTMP_BASE = "rtmp://a.rtmp.youtube.com/live2"
+
+          START_TIME = time.time()
+          RELAY_TIME = (5 * 3600) + (45 * 60)
+
+          STATE = {
+              "mode": "frenchcore",
+              "bpm": 200,
+              "title": "🔴 24/7 AI RAVE GENERATOR | FRENCHCORE & HARDTECHNO LIVE",
+              "hud_text": "24/7 AI AUTONOMOUS STREAM - 200 BPM",
+              "video_url": "https://cdn.pixabay.com/video/2023/10/22/186115-877653483_large.mp4",
+              "audio_url": "https://stream.nightride.fm/chillsynth.m4a",
+              "rtmp_url": "",
+              "broadcast_id": ""
+          }
+
+          bot = Bot(token=TG_TOKEN)
+          dp = Dispatcher()
+          ffmpeg_proc = None
+
+          def generate_ai_metadata(topic):
+              prompt = f"Genera un título magnético con emojis (máximo 85 caracteres) para un directo 24/7 de YouTube sobre: {topic}. Devuelve SOLO el título."
+              try:
+                  res = requests.post(GEMINI_URL, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=10)
+                  if res.status_code == 200:
+                      return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+              except Exception:
+                  pass
+              # Fallback automático a Pollinations AI
+              try:
+                  res = requests.post(POLLINATIONS_URL, json={"messages": [{"role": "user", "content": prompt}]}, timeout=10)
+                  if res.status_code == 200:
+                      return res.json()["choices"][0]["message"]["content"].strip()
+              except Exception:
+                  pass
+              return f"🔴 24/7 LIVE STREAM | {topic.upper()}"
+
+          def get_youtube_client():
+              creds = Credentials(
+                  None,
+                  refresh_token=os.getenv("YT_REFRESH_TOKEN"),
+                  token_uri="https://oauth2.googleapis.com/token",
+                  client_id=os.getenv("G_CLIENT_ID"),
+                  client_secret=os.getenv("G_CLIENT_SECRET"),
+                  scopes=[
+                      "https://www.googleapis.com/auth/youtube.upload",
+                      "https://www.googleapis.com/auth/youtube.force-ssl"
+                  ]
+              )
+              return build("youtube", "v3", credentials=creds)
+
+          def create_or_reuse_live_broadcast():
+              yt = get_youtube_client()
+              active_res = yt.liveBroadcasts().list(part="id,snippet,contentDetails", broadcastStatus="active").execute()
+              if active_res.get("items"):
+                  b_item = active_res["items"][0]
+                  stream_id = b_item["contentDetails"]["boundStreamId"]
+                  s_res = yt.liveStreams().list(part="cdn", id=stream_id).execute()
+                  ing = s_res["items"][0]["cdn"]["ingestionInfo"]
+                  STATE["rtmp_url"] = f"{ing['ingestionAddress']}/{ing['streamName']}"
+                  STATE["broadcast_id"] = b_item["id"]
+                  return f"https://youtu.be/{b_item['id']} (Relevo sin cortes)"
+
+              now_iso = datetime.now(timezone.utc).isoformat()
+              b_body = {
+                  "snippet": {
+                      "title": STATE["title"][:95],
+                      "description": "Directo 24/7 generado y controlado autónomamente por IA (Gemini 2.5 Flash + FFmpeg DSP).",
+                      "scheduledStartTime": now_iso
+                  },
+                  "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+                  "contentDetails": {"enableAutoStart": True, "enableAutoStop": False}
+              }
+              broadcast = yt.liveBroadcasts().insert(part="snippet,status,contentDetails", body=b_body).execute()
+
+              s_body = {
+                  "snippet": {"title": f"AutoStreamKey-{int(time.time())}"},
+                  "cdn": {"frameRate": "30fps", "ingestionType": "rtmp", "resolution": "720p"}
+              }
+              stream = yt.liveStreams().insert(part="snippet,cdn", body=s_body).execute()
+              yt.liveBroadcasts().bind(part="id,contentDetails", id=broadcast["id"], streamId=stream["id"]).execute()
+
+              ing = stream["cdn"]["ingestionInfo"]
+              STATE["rtmp_url"] = f"{ing['ingestionAddress']}/{ing['streamName']}"
+              STATE["broadcast_id"] = broadcast["id"]
+              return f"https://youtu.be/{broadcast['id']}"
+
+          def build_rave_dsp(style, bpm):
+              bps = bpm / 60.0
+              if style == "hardtechno":
+                  return f"tanh(5*(sin(2*PI*(52*exp(-mod(t*{bps},1)*12))*t)*exp(-mod(t*{bps},1)*7)+0.35*sin(2*PI*38*t)*(1-exp(-mod(t*{bps},1)*14))+0.15*(random(0)-0.5)*exp(-mod(t*{bps}+0.5,1)*25)))"
+              elif style == "psytrance":
+                  return f"tanh(3.5*(sin(2*PI*(60*exp(-mod(t*{bps},1)*18))*t)*exp(-mod(t*{bps},1)*10)+0.45*sin(2*PI*(73.4+40*exp(-mod(t*{bps}*4,1)*20))*t)*exp(-mod(t*{bps}*4,1)*9)*gt(mod(t*{bps}*4,4),1)+0.2*sin(2*PI*(220+110*sin(2*PI*0.25*t))*t+2*sin(2*PI*146.8*t))))"
+              elif style == "frenchcore":
+                  return f"tanh(8*(sin(2*PI*(85*exp(-mod(t*{bps},1)*9)+48)*t)*exp(-mod(t*{bps},1)*4.5)+0.5*sin(2*PI*96*t)*exp(-mod(t*{bps}+0.5,1)*6)+0.2*sin(2*PI*(440+220*floor(mod(t*{bps}/2,4)))*t)*exp(-mod(t*{bps}*2,1)*12)))"
+              else:
+                  return f"tanh(12*(sin(2*PI*(110*exp(-mod(t*{bps},1)*14)+55)*t)*exp(-mod(t*{bps},1)*6)+0.3*(random(0)-0.5)*exp(-mod(t*{bps}*2,1)*15)))"
+
+          def update_hud_file():
+              with open("live_hud.txt", "w", encoding="utf-8") as f:
+                  f.write(STATE["hud_text"])
+
+          def build_pipeline():
+              update_hud_file()
+              hud = "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile=live_hud.txt:reload=1:fontcolor=white:fontsize=34:box=1:boxcolor=black@0.7:boxborderw=12:x=(w-text_w)/2:y=h-75"
+              mode = STATE["mode"]
+              bpm = STATE["bpm"]
+
+              if mode in ["hardtechno", "psytrance", "frenchcore", "speedcore"]:
+                  dsp = build_rave_dsp(mode, bpm)
+                  return [
+                      "ffmpeg", "-re",
+                      "-f", "lavfi", "-i", f"mandelbrot=size=1280x720:rate=30,hue=h=t*{int(bpm/4)}:s=2,{hud}",
+                      "-f", "lavfi", "-i", f"aevalsrc='{dsp}':s=44100",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2800k", "-maxrate", "2800k", "-bufsize", "5600k",
+                      "-pix_fmt", "yuv420p", "-g", "60", "-c:a", "aac", "-b:a", "160k", "-f", "flv", STATE["rtmp_url"]
+                  ]
+              elif mode == "music_radio":
+                  return [
+                      "ffmpeg", "-re", "-stream_loop", "-1", "-i", STATE["video_url"], "-i", STATE["audio_url"],
+                      "-vf", f"scale=1280:720,hue=h=t*2,{hud}", "-map", "0:v:0", "-map", "1:a:0",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2800k", "-pix_fmt", "yuv420p", "-g", "60",
+                      "-c:a", "aac", "-b:a", "128k", "-f", "flv", STATE["rtmp_url"]
+                  ]
+              else:
+                  return [
+                      "ffmpeg", "-re", "-stream_loop", "-1", "-i", STATE["video_url"],
+                      "-vf", f"scale=1280:720,{hud}",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2800k", "-pix_fmt", "yuv420p", "-g", "60",
+                      "-c:a", "aac", "-b:a", "128k", "-f", "flv", STATE["rtmp_url"]
+                  ]
+
+          def restart_stream():
+              global ffmpeg_proc
+              if ffmpeg_proc:
+                  ffmpeg_proc.terminate()
+                  try: ffmpeg_proc.wait(timeout=5)
+                  except: ffmpeg_proc.kill()
+              if STATE["rtmp_url"]:
+                  ffmpeg_proc = subprocess.Popen(build_pipeline())
+
+          @dp.message(Command("start", "panel"))
+          async def cmd_panel(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              await msg.reply(
+                  f"🤖 **OMNISTREAM AI 24/7 ACTIVO**\n"
+                  f"📺 Directo: https://youtu.be/{STATE['broadcast_id']}\n"
+                  f"🎛 Modo: {STATE['mode']} ({STATE['bpm']} BPM)\n\n"
+                  "Comandos:\n"
+                  "• /ia_directo Tema -> Gemini crea título SEO y abre nuevo directo\n"
+                  "• /modo frenchcore | psytrance | hardtechno | speedcore | music_radio | video_loop\n"
+                  "• /bpm 210 -> Ajusta velocidad en vivo\n"
+                  "• /texto Mensaje -> Cambia rótulo en pantalla sin cortar\n"
+                  "• /video URL_MP4 | /audio URL_AUDIO"
+              )
+
+          @dp.message(Command("ia_directo"))
+          async def cmd_ai_live(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              tema = msg.text.replace("/ia_directo ", "").strip() or STATE["mode"]
+              await msg.reply("🧠 Generando título con Gemini/Pollinations y creando sala en YouTube...")
+              STATE["title"] = generate_ai_metadata(tema)
+              yt = get_youtube_client()
+              if STATE["broadcast_id"]:
+                  try: yt.liveBroadcasts().transition(broadcastStatus="complete", id=STATE["broadcast_id"], part="id,status").execute()
+                  except: pass
+                  STATE["broadcast_id"] = ""
+              url = create_or_reuse_live_broadcast()
+              restart_stream()
+              await msg.reply(f"🚀 **Nuevo directo creado por IA:**\n📌 {STATE['title']}\n🔗 {url}")
+
+          @dp.message(Command("modo"))
+          async def cmd_mode(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              parts = msg.text.split()
+              if len(parts) > 1:
+                  STATE["mode"] = parts[1]
+                  defaults = {"hardtechno": 155, "psytrance": 145, "frenchcore": 200, "speedcore": 280}
+                  if parts[1] in defaults:
+                      STATE["bpm"] = defaults[parts[1]]
+                      STATE["hud_text"] = f"24/7 {parts[1].upper()} LIVE - {STATE['bpm']} BPM"
+                  restart_stream()
+                  await msg.reply(f"✅ Modo cambiado a **{STATE['mode']}** ({STATE['bpm']} BPM)")
+
+          @dp.message(Command("bpm"))
+          async def cmd_bpm(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              try:
+                  STATE["bpm"] = max(60, min(500, int(msg.text.split()[1])))
+                  STATE["hud_text"] = f"24/7 {STATE['mode'].upper()} LIVE - {STATE['bpm']} BPM"
+                  restart_stream()
+                  await msg.reply(f"🔥 BPM a **{STATE['bpm']}**")
+              except:
+                  await msg.reply("Usa: /bpm 210")
+
+          @dp.message(Command("texto"))
+          async def cmd_text(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              STATE["hud_text"] = msg.text.replace("/texto ", "").strip()
+              update_hud_file()
+              await msg.reply("⚡ Rótulo actualizado sin cortes.")
+
+          @dp.message(Command("video"))
+          async def cmd_video(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              STATE["video_url"] = msg.text.replace("/video ", "").strip()
+              restart_stream()
+              await msg.reply("🎬 Vídeo inyectado.")
+
+          @dp.message(Command("audio"))
+          async def cmd_audio(msg: types.Message):
+              if msg.from_user.id != ADMIN_ID: return
+              STATE["audio_url"] = msg.text.replace("/audio ", "").strip()
+              restart_stream()
+              await msg.reply("🎵 Audio inyectado.")
+
+          async def watchdog():
+              while True:
+                  if ffmpeg_proc and ffmpeg_proc.poll() is not None:
+                      restart_stream()
+                  if (time.time() - START_TIME) >= RELAY_TIME:
+                      await bot.send_message(ADMIN_ID, "🔄 Relevo automático 24/7 en marcha...")
+                      requests.post(
+                          f"https://api.github.com/repos/{GH_REPO}/actions/workflows/omnistream.yml/dispatches",
+                          headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"},
+                          json={"ref": "main"}
+                      )
+                      await asyncio.sleep(45)
+                      if ffmpeg_proc: ffmpeg_proc.terminate()
+                      os._exit(0)
+                  await asyncio.sleep(5)
+
+          async def main():
+              STATE["title"] = generate_ai_metadata(f"{STATE['mode']} {STATE['bpm']} BPM")
+              url = create_or_reuse_live_broadcast()
+              restart_stream()
+              await bot.send_message(ADMIN_ID, f"🚀 **Directo 24/7 Creado y Emitiendo:**\n📌 {STATE['title']}\n🔗 {url}\n\nEscribe /panel para ver los controles.")
+              asyncio.create_task(watchdog())
+              await dp.start_polling(bot)
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          PYEOF
+          python3 autonomous_streamer.py
